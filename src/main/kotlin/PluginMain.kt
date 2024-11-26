@@ -1,118 +1,162 @@
 package org.example.mirai.plugin
 
-import net.mamoe.mirai.console.permission.AbstractPermitteeId
-import net.mamoe.mirai.console.permission.PermissionService
-import net.mamoe.mirai.console.permission.PermissionService.Companion.hasPermission
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.github.kittinunf.fuel.httpPost
+import com.github.kittinunf.result.Result
+import kotlinx.coroutines.launch
+import net.mamoe.mirai.console.data.AutoSavePluginData
+import net.mamoe.mirai.console.data.value
+import net.mamoe.mirai.console.plugin.jvm.JavaPlugin
 import net.mamoe.mirai.console.plugin.jvm.JvmPluginDescription
-import net.mamoe.mirai.console.plugin.jvm.KotlinPlugin
-import net.mamoe.mirai.contact.Member
-import net.mamoe.mirai.contact.User
-import net.mamoe.mirai.event.GlobalEventChannel
-import net.mamoe.mirai.event.events.BotInvitedJoinGroupRequestEvent
-import net.mamoe.mirai.event.events.FriendMessageEvent
-import net.mamoe.mirai.event.events.GroupMessageEvent
-import net.mamoe.mirai.event.events.NewFriendRequestEvent
-import net.mamoe.mirai.message.data.Image
-import net.mamoe.mirai.message.data.Image.Key.queryUrl
-import net.mamoe.mirai.message.data.PlainText
-import net.mamoe.mirai.utils.info
+import net.mamoe.mirai.contact.Contact
+import net.mamoe.mirai.event.events.MessageEvent
+import net.mamoe.mirai.event.globalEventChannel
 
-/**
- * 使用 kotlin 版请把
- * `src/main/resources/META-INF.services/net.mamoe.mirai.console.plugin.jvm.JvmPlugin`
- * 文件内容改成 `org.example.mirai.plugin.PluginMain` 也就是当前主类全类名
- *
- * 使用 kotlin 可以把 java 源集删除不会对项目有影响
- *
- * 在 `settings.gradle.kts` 里改构建的插件名称、依赖库和插件版本
- *
- * 在该示例下的 [JvmPluginDescription] 修改插件名称，id和版本，etc
- *
- * 可以使用 `src/test/kotlin/RunMirai.kt` 在 ide 里直接调试，
- * 不用复制到 mirai-console-loader 或其他启动器中调试
- */
+// 配置和绑定数据管理
+object ConfigData : AutoSavePluginData("ConfigData") {
+    var apiUrl: String by value("https://loj2urwaua.execute-api.ap-northeast-1.amazonaws.com/prod/coupon")
+    var appId: String by value("bd2-live")
+}
 
-object PluginMain : KotlinPlugin(
+object BindingData : AutoSavePluginData("BindingData") {
+    val userBindings by value<MutableMap<Long, String>>() // QQ号 -> userId 映射
+}
+
+object PluginMain : JavaPlugin(
     JvmPluginDescription(
-        id = "org.example.mirai-example",
-        name = "插件示例",
-        version = "0.1.0"
+        id = "com.kingko.bd2redeem",
+        name = "BD2redeem",
+        version = "1.2.0"
     ) {
-        author("作者名称或联系方式")
-        info(
-            """
-            这是一个测试插件, 
-            在这里描述插件的功能和用法等.
-        """.trimIndent()
-        )
-        // author 和 info 可以删除.
+        author("KingKo")
+        info("改进版兑换码插件")
     }
 ) {
+    private val redeemAliases = listOf("/redeem", "/兑换") // 为兑换指令增加别名
+
     override fun onEnable() {
-        logger.info { "Plugin loaded" }
-        //配置文件目录 "${dataFolder.absolutePath}/"
-        val eventChannel = GlobalEventChannel.parentScope(this)
-        eventChannel.subscribeAlways<GroupMessageEvent> {
-            //群消息
-            //复读示例
-            if (message.contentToString().startsWith("复读")) {
-                group.sendMessage(message.contentToString().replace("复读", ""))
+        ConfigData.reload()
+        BindingData.reload()
+        globalEventChannel().subscribeAlways<MessageEvent> { event ->
+            handleCommand(event)
+        }
+        logger.info("BD2redeem插件已启用！")
+    }
+
+    private suspend fun handleCommand(event: MessageEvent) {
+        val command = event.message.contentToString().trim()
+
+        when {
+            command.startsWith("/绑定 ") -> handleBindCommand(event, command)
+            command == "/解绑" -> handleUnbindCommand(event)
+            redeemAliases.any { command.startsWith(it) } -> handleRedeemCommand(event, command)
+        }
+    }
+
+    private suspend fun handleBindCommand(event: MessageEvent, command: String) {
+        val userId = command.substringAfter("/绑定 ").trim()
+        if (userId.isNotEmpty()) {
+            BindingData.userBindings[event.sender.id] = userId
+            event.subject.sendMessage("已成功绑定 userId：$userId")
+        } else {
+            event.subject.sendMessage("绑定失败，请提供有效的 userId。")
+        }
+    }
+
+    private suspend fun handleUnbindCommand(event: MessageEvent) {
+        if (BindingData.userBindings.remove(event.sender.id) != null) {
+            event.subject.sendMessage("已成功解除绑定。")
+        } else {
+            event.subject.sendMessage("您未绑定任何 userId。")
+        }
+    }
+
+    private suspend fun handleRedeemCommand(event: MessageEvent, command: String) {
+        val args = redeemAliases
+            .first { command.startsWith(it) }
+            .let { command.substringAfter(it).trim() }
+            .split(" ")
+
+        when {
+            args.size == 2 -> {
+                val userId = args[0]
+                val code = args[1]
+                sendRedeemRequest(event.subject, userId, code)
             }
-            if (message.contentToString() == "hi") {
-                //群内发送
-                group.sendMessage("hi")
-                //向发送者私聊发送消息
-                sender.sendMessage("hi")
-                //不继续处理
-                return@subscribeAlways
-            }
-            //分类示例
-            message.forEach {
-                //循环每个元素在消息里
-                if (it is Image) {
-                    //如果消息这一部分是图片
-                    val url = it.queryUrl()
-                    group.sendMessage("图片，下载地址$url")
+            args.size == 1 -> {
+                val code = args[0]
+                val userId = BindingData.userBindings[event.sender.id]
+                if (userId != null) {
+                    sendRedeemRequest(event.subject, userId, code)
+                } else {
+                    event.subject.sendMessage("您未绑定 userId，请使用 /绑定 <userId> 指令进行绑定。")
                 }
-                if (it is PlainText) {
-                    //如果消息这一部分是纯文本
-                    group.sendMessage("纯文本，内容:${it.content}")
+            }
+            else -> {
+                event.subject.sendMessage("使用方式：/兑换 <userId> <code> 或 /兑换 <code>")
+            }
+        }
+    }
+
+    private fun sendRedeemRequest(contact: Contact, userId: String, code: String) {
+        val requestBody = mapOf(
+            "appId" to ConfigData.appId,
+            "userId" to userId,
+            "code" to code
+        )
+
+        ConfigData.apiUrl.httpPost()
+            .header(mapOf(
+                "Content-Type" to "application/json",
+                "Origin" to "https://redeem.bd2.pmang.cloud"
+            ))
+            .body(Gson().toJson(requestBody))
+            .responseString { _, response, result ->
+                handleApiResponse(contact, response.statusCode, result)
+            }
+    }
+
+    private fun handleApiResponse(contact: Contact, statusCode: Int, result: Result<String, Exception>) {
+        launch {
+            when (result) {
+                is Result.Success -> {
+                    val data = result.get()
+                    try {
+                        val json = JsonParser.parseString(data).asJsonObject
+                        if (json.has("error")) {
+                            val errorElement = json.get("error")
+                            val errorMessage = when {
+                                errorElement.isJsonObject -> {
+                                    errorElement.asJsonObject.get("message")?.asString ?: ""
+                                }
+                                errorElement.isJsonPrimitive -> {
+                                    errorElement.asJsonPrimitive.asString
+                                }
+                                else -> ""
+                            }
+
+                            // 根据 errormessage 的内容反馈对应信息
+                            val feedback = when (errorMessage) {
+                                "InvalidCode" -> "兑换码无效，请检查后重试。"
+                                "AlreadyUsed" -> "该兑换码已被使用，请更换其他兑换码。"
+                                "IncorrectUser" -> "用户ID不存在，请检查后重试"
+                                "" -> "兑换成功！" // errormessage 为空，表示成功
+                                else -> "发生未知错误：$errorMessage"
+                            }
+                            contact.sendMessage(feedback)
+                        } else {
+                            contact.sendMessage("兑换成功！") // 没有 "error" 字段，默认成功
+                        }
+                    } catch (e: Exception) {
+                        contact.sendMessage("响应解析失败：${e.message}")
+                    }
+                }
+                is Result.Failure -> {
+                    contact.sendMessage("请求失败，状态码 $statusCode：${result.getException().message}")
                 }
             }
         }
-        eventChannel.subscribeAlways<FriendMessageEvent> {
-            //好友信息
-            sender.sendMessage("hi")
-        }
-        eventChannel.subscribeAlways<NewFriendRequestEvent> {
-            //自动同意好友申请
-            accept()
-        }
-        eventChannel.subscribeAlways<BotInvitedJoinGroupRequestEvent> {
-            //自动同意加群申请
-            accept()
-        }
-
-        myCustomPermission // 注册权限
     }
-
-    // region console 权限系统示例
-    private val myCustomPermission by lazy { // Lazy: Lazy 是必须的, console 不允许提前访问权限系统
-        // 注册一条权限节点 org.example.mirai-example:my-permission
-        // 并以 org.example.mirai-example:* 为父节点
-
-        // @param: parent: 父权限
-        //                 在 Console 内置权限系统中, 如果某人拥有父权限
-        //                 那么意味着此人也拥有该权限 (org.example.mirai-example:my-permission)
-        // @func: PermissionIdNamespace.permissionId: 根据插件 id 确定一条权限 id
-        PermissionService.INSTANCE.register(permissionId("my-permission"), "一条自定义权限", parentPermission)
-    }
-
-    public fun hasCustomPermission(sender: User): Boolean {
-        return when (sender) {
-            is Member -> AbstractPermitteeId.ExactMember(sender.group.id, sender.id)
-            else -> AbstractPermitteeId.ExactUser(sender.id)
-        }.hasPermission(myCustomPermission)
-    }
-    // endregion
 }
