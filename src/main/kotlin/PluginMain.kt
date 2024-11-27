@@ -57,9 +57,15 @@ object PluginMain : JavaPlugin(
 
     private suspend fun handleBindCommand(event: MessageEvent, command: String) {
         val userId = command.substringAfter("/绑定 ").trim()
+        val existingUserid = BindingData.userBindings[event.sender.id]
         if (userId.isNotEmpty()) {
-            BindingData.userBindings[event.sender.id] = userId
-            event.subject.sendMessage("已成功绑定 userId：$userId")
+            if(existingUserid != null){
+                event.subject.sendMessage("你已绑定：$existingUserid 。请先解绑")
+
+            }else {
+                BindingData.userBindings[event.sender.id] = userId
+                event.subject.sendMessage("已成功绑定 userId：$userId")
+            }
         } else {
             event.subject.sendMessage("绑定失败，请提供有效的 userId。")
         }
