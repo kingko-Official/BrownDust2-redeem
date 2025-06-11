@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "org.kingko"
-version = "1.0.0"
+version = "1.1.0"
 
 repositories {
     if (System.getenv("CI")?.toBoolean() != true) {
@@ -16,6 +16,6 @@ repositories {
     mavenCentral()
 }
 dependencies {
-    implementation("com.github.kittinunf.fuel:fuel:2.3.1")
+    implementation("com.squareup.okhttp3:okhttp:4.9.3")
     implementation("com.google.code.gson:gson:2.8.9")
 }
