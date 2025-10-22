@@ -15,7 +15,6 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
-import java.util.*
 
 object ConfigData : AutoSavePluginData("ConfigData") {
     var apiUrl: String by value("https://loj2urwaua.execute-api.ap-northeast-1.amazonaws.com/prod/coupon")
@@ -27,9 +26,8 @@ object BindingData : AutoSavePluginData("BindingData") {
 }
 
 object UsedCodeData : AutoSavePluginData("UsedCodeData") {
-    val usedCodes by value<MutableMap<Long, MutableList<String>>>() // 使用 MutableList 替代 LinkedList
+    val usedCodes by value<MutableMap<Long, MutableList<String>>>()
 }
-
 
 val httpClient = OkHttpClient()
 
@@ -37,10 +35,10 @@ object PluginMain : JavaPlugin(
     JvmPluginDescription(
         id = "com.kingko.bd2redeem",
         name = "BD2redeem",
-        version = "1.2.0"
+        version = "1.2.2"
     ) {
         author("KingKo")
-        info("改进版兑换码插件")
+        info("兑换码插件")
     }
 ) {
     private val redeemAliases = listOf("/redeem", "/兑换")
@@ -71,21 +69,31 @@ object PluginMain : JavaPlugin(
     private suspend fun handleBindCommand(event: MessageEvent, command: String) {
         val userId = command.substringAfter("/绑定 ").trim()
         val existingUserid = BindingData.userBindings[event.sender.id]
-        if (userId.isNotEmpty()) {
-            if (existingUserid != null) {
-                event.subject.sendMessage("你已绑定：$existingUserid 。请先解绑")
-            } else {
-                BindingData.userBindings[event.sender.id] = userId
-                event.subject.sendMessage("已成功绑定 userId：$userId")
-            }
-        } else {
+
+        if (userId.isEmpty()) {
             event.subject.sendMessage("绑定失败，请提供有效的 userId。")
+            return
+        }
+
+        // 添加格式验证
+        if (userId.length < 2 || userId.contains(" ")) {
+            event.subject.sendMessage("userId 格式不正确，请检查后重试。")
+            return
+        }
+
+        if (existingUserid != null) {
+            event.subject.sendMessage("你已绑定：$existingUserid 。请先解绑")
+        } else {
+            BindingData.userBindings[event.sender.id] = userId
+            event.subject.sendMessage("已成功绑定 userId：$userId")
+            logger.info("用户 ${event.sender.id} 绑定 userId: $userId")
         }
     }
 
     private suspend fun handleUnbindCommand(event: MessageEvent) {
         if (BindingData.userBindings.remove(event.sender.id) != null) {
             event.subject.sendMessage("已成功解除绑定。")
+            logger.info("用户 ${event.sender.id} 解除绑定")
         } else {
             event.subject.sendMessage("您未绑定任何 userId。")
         }
@@ -119,7 +127,8 @@ object PluginMain : JavaPlugin(
     }
 
     private suspend fun sendRedeemRequest(contact: Contact, qq: Long, userId: String, code: String) {
-        val history = UsedCodeData.usedCodes.getOrPut(qq) { LinkedList() }
+        val history = UsedCodeData.usedCodes.getOrPut(qq) { mutableListOf() }
+
         if (code in history) {
             contact.sendMessage("换过了")
             return
@@ -131,29 +140,52 @@ object PluginMain : JavaPlugin(
             "code" to code
         )
 
+        val jsonBody = Gson().toJson(requestBody)
+
+        // 添加日志用于调试
+        logger.info("发送兑换请求: appId=${ConfigData.appId}, userId=$userId, code=$code")
+
         val request = Request.Builder()
             .url(ConfigData.apiUrl)
-            .post(Gson().toJson(requestBody).toRequestBody("application/json".toMediaType()))
+            .post(jsonBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
             .header("Origin", "https://redeem.bd2.pmang.cloud")
+            .header("Referer", "https://redeem.bd2.pmang.cloud/")
+            .header("Accept", "application/json")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .build()
 
         httpClient.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                logger.error("请求失败: ${e.message}", e)
                 handleApiResponse(contact, 0, Result.failure(e))
             }
 
             override fun onResponse(call: Call, response: Response) {
+                val bodyStr = response.body?.string() ?: ""
+
+                // 添加详细日志
+                logger.info("API响应: code=${response.code}, body=$bodyStr")
+
                 if (response.isSuccessful) {
-                    val bodyStr = response.body?.string() ?: ""
-                    val json = JsonParser.parseString(bodyStr).asJsonObject
-                    if (!json.has("error")) {
-                        if (!history.contains(code)) {
-                            if (history.size >= 5) history.removeAt(0)
-                            history.add(code)
+                    try {
+                        val json = JsonParser.parseString(bodyStr).asJsonObject
+
+                        if (!json.has("error")) {
+                            // 兑换成功，保存记录
+                            if (!history.contains(code)) {
+                                if (history.size >= 5) history.removeAt(0)
+                                history.add(code)
+                                UsedCodeData.save()
+                                logger.info("保存兑换记录: qq=$qq, code=$code")
+                            }
                         }
 
+                        handleApiResponse(contact, response.code, Result.success(bodyStr))
+                    } catch (e: Exception) {
+                        logger.error("解析响应失败: ${e.message}", e)
+                        handleApiResponse(contact, response.code, Result.failure(e))
                     }
-                    handleApiResponse(contact, response.code, Result.success(bodyStr))
                 } else {
                     handleApiResponse(contact, response.code, Result.failure(Exception("HTTP失败：${response.code}")))
                 }
@@ -179,18 +211,22 @@ object PluginMain : JavaPlugin(
                     }
 
                     val feedback = when (errorMessage) {
-                        "InvalidCode" -> "打错了"
-                        "AlreadyUsed" -> "换过了"
+                        "InvalidCode" -> "打错了吧"
+                        "AlreadyUsed" -> "换过了吧"
                         "IncorrectUser" -> "。名字绑错了"
-                        "ExpiredCode" -> "过期了"
+                        "ExpiredCode" -> "过期了吧"
+                        "UnavailableCode" -> "还不让用"
+                        "BadRequest" -> "请求格式错误，请检查用户名格式是否正确"
                         "" -> "兑换成功！"
                         else -> "发生未知错误：$errorMessage"
                     }
                     contact.sendMessage(feedback)
                 } catch (e: Exception) {
+                    logger.error("响应解析失败: ${e.message}", e)
                     contact.sendMessage("响应解析失败：${e.message}")
                 }
             }.onFailure {
+                logger.error("请求失败，状态码 $statusCode: ${it.message}", it)
                 contact.sendMessage("请求失败，状态码 $statusCode：${it.message}")
             }
         }
@@ -236,5 +272,4 @@ object PluginMain : JavaPlugin(
             event.subject.sendMessage("$name 最近的兑换记录如下：\n$msg")
         }
     }
-
 }
